@@ -1,0 +1,10 @@
+Generic single-database configuration with an async dbapi.
+
+Alembic will:
+- Load the Alembic configuration from alembic.ini
+- Load the alembic/env.py file, which provides the
+  run_migrations_offline() and run_migrations_online() functions
+- Discover migration files from the alembic/versions directory
+- Compare the database schema with the target_metadata in env.py
+- Generate migration scripts automatically
+
