@@ -1,0 +1,30 @@
+# 파일 경로: services/core_api/requirements.txt
+
+# --- API Framework ---
+fastapi
+uvicorn[standard]
+
+# --- Database (PostgreSQL) ---
+sqlalchemy[asyncio]>=2.0.0
+asyncpg  # 비동기 PostgreSQL 드라이버
+alembic  # DB 마이그레이션 도구
+
+# --- AI Integration (OpenAI) ---
+openai
+
+# --- Security & Authentication ---
+python-jose[cryptography]
+passlib[bcrypt]
+
+# --- HTTP Client ---
+httpx
+
+# --- Data Validation ---
+pydantic
+pydantic-settings  # 설정 관리용
+
+# --- [NEW] .env 파일 로더 ---
+python-dotenv
+
+# --- Logging ---
+structlog  # 구조화된 로깅

@@ -1,0 +1,13 @@
+# 파일 경로: services/data_processor/requirements.txt
+
+# --- Micro Web Framework ---
+flask
+flask-cors
+
+# --- Data Handling ---
+yfinance
+pandas
+
+# --- WSGI Server (for Production) ---
+# Docker에서 Python 앱을 실행할 때 사용할 프로덕션 서버
+gunicorn

@@ -1,0 +1,16 @@
+# .gitignore (reflex_project/.gitignore)
+
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# --- IDE ---
+.vscode/
+.idea/
+
+# --- Env ---
+# !! .env 파일을 절대로 Git에 커밋하지 않습니다 !!
+.env
+services/*/.env
