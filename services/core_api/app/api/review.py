@@ -4,7 +4,8 @@
 """
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 from typing import Annotated
 import httpx
 import re
@@ -18,6 +19,10 @@ from app.models.schemas import (
     AIAnalysisResponse
 )
 from app.core.config import get_settings
+from app.core.logging_config import get_logger
+
+# 로거 설정
+logger = get_logger(__name__)
 
 router = APIRouter(prefix="/review", tags=["Review"])
 
@@ -40,7 +45,7 @@ def extract_profit_loss_rate(trade_info: str) -> float | None:
 @router.post("", response_model=AIAnalysisResponse, status_code=status.HTTP_201_CREATED)
 async def create_review(
     request: ReviewCreateRequest,
-    db: Annotated[Session, Depends(get_db)],
+    db: Annotated[AsyncSession, Depends(get_db)],
     current_user: Annotated[User, Depends(get_current_user)]
 ):
     """
@@ -52,6 +57,8 @@ async def create_review(
     3. Trade 레코드 생성 (또는 기존 Trade 조회)
     4. ReviewNote 레코드 생성 및 저장
     
+    트랜잭션 관리: AI 호출 실패 시에도 Trade가 남지 않도록 전체를 하나의 트랜잭션으로 처리
+    
     Returns:
         AIAnalysisResponse: AI 분석 결과 (analysis, questions, primary_type, secondary_type)
     """
@@ -59,26 +66,41 @@ async def create_review(
     # --- 1. data_processor 호출 (객관적 데이터 확보) ---
     objective_data = {}
     try:
+        logger.info("시장 데이터 수집 시작", ticker=request.ticker)
         async with httpx.AsyncClient(timeout=settings.DATA_PROCESSOR_TIMEOUT) as client:
             params = {"ticker": request.ticker, "market_index": "^KS11"}
             response = await client.get(DATA_PROCESSOR_URL, params=params)
             response.raise_for_status()
             objective_data = response.json()
+            logger.info("시장 데이터 수집 완료", ticker=request.ticker)
             
     except httpx.HTTPStatusError as e:
+        logger.error(
+            "시장 데이터 서버 연결 실패",
+            error=str(e),
+            status_code=e.response.status_code,
+            ticker=request.ticker
+        )
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"시장 데이터 서버(data_processor)에 연결할 수 없습니다: {e}"
+            detail="시장 데이터 서버에 연결할 수 없습니다. 잠시 후 다시 시도해주세요."
         )
     except httpx.ReadTimeout:
+        logger.error("시장 데이터 서버 타임아웃", timeout=settings.DATA_PROCESSOR_TIMEOUT)
         raise HTTPException(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
             detail="시장 데이터 서버(data_processor) 응답 시간이 초과되었습니다."
         )
     except Exception as e:
+        logger.error(
+            "시장 데이터 수집 중 예외 발생",
+            error=str(e),
+            error_type=type(e).__name__,
+            ticker=request.ticker
+        )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"데이터 처리 중 오류가 발생했습니다: {str(e)}"
+            detail="시장 데이터를 가져오는 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요."
         )
 
     # --- 2. AI 입력 데이터 준비 ---
@@ -99,30 +121,36 @@ async def create_review(
     }
 
     # --- 3. gpt_service 호출 (AI 분석 및 분류) ---
+    # 트랜잭션 시작 전에 AI 호출하여 실패 시 DB 작업을 하지 않도록 함
     from app.services.gpt_service import get_ai_feedback
-    ai_response = get_ai_feedback(ai_input_data)
+    logger.info("AI 분석 시작", user_id=current_user.id, ticker=request.ticker)
+    ai_response = await get_ai_feedback(ai_input_data)
     
     if ai_response.get("error"):
+        logger.error("AI 분석 실패", error=ai_response.get("error"), user_id=current_user.id)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"AI 분석 실패: {ai_response['error']}"
         )
-
-    # --- 4. Trade 레코드 생성 또는 조회 ---
-    # trade_info에서 손익률 추출
-    profit_loss_rate = extract_profit_loss_rate(request.trade_info)
     
-    # 새로운 Trade 생성
-    new_trade = Trade(
-        user_id=current_user.id,
-        ticker=request.ticker,
-        profit_loss_rate=profit_loss_rate
-    )
-    db.add(new_trade)
-    db.flush()  # trade_id를 얻기 위해 flush (아직 commit은 안 함)
+    logger.info("AI 분석 완료", user_id=current_user.id, primary_type=ai_response.get("primary_type"))
 
-    # --- 5. ReviewNote 레코드 생성 및 저장 ---
+    # --- 4. Trade 및 ReviewNote 레코드 생성 및 저장 (트랜잭션) ---
+    # AI 호출이 성공한 후에만 DB 작업 수행
     try:
+        # trade_info에서 손익률 추출
+        profit_loss_rate = extract_profit_loss_rate(request.trade_info)
+        
+        # 새로운 Trade 생성
+        new_trade = Trade(
+            user_id=current_user.id,
+            ticker=request.ticker,
+            profit_loss_rate=profit_loss_rate
+        )
+        db.add(new_trade)
+        await db.flush()  # trade_id를 얻기 위해 flush (아직 commit은 안 함)
+
+        # ReviewNote 레코드 생성
         new_note = ReviewNote(
             user_id=current_user.id,
             trade_id=new_trade.id,
@@ -135,17 +163,35 @@ async def create_review(
             secondary_type=ai_response.get("secondary_type")
         )
         db.add(new_note)
-        db.commit()
-        db.refresh(new_note)
+        
+        # 전체 트랜잭션 커밋 (Trade와 ReviewNote 모두 성공적으로 저장)
+        await db.commit()
+        await db.refresh(new_note)
+        
+        logger.info(
+            "복기 노트 생성 완료",
+            user_id=current_user.id,
+            review_id=new_note.id,
+            trade_id=new_trade.id
+        )
         
     except Exception as e:
-        db.rollback()
+        # 에러 발생 시 롤백 (Trade도 함께 롤백됨)
+        await db.rollback()
+        logger.error(
+            "복기 노트 저장 실패",
+            error=str(e),
+            error_type=type(e).__name__,
+            user_id=current_user.id,
+            ticker=request.ticker,
+            traceback=str(e.__traceback__) if hasattr(e, '__traceback__') else None
+        )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"분석 결과를 저장하는 데 실패했습니다: {str(e)}"
+            detail="복기 노트를 저장하는 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요."
         )
 
-    # --- 6. AI 응답 반환 ---
+    # --- 5. AI 응답 반환 ---
     return AIAnalysisResponse(
         analysis=ai_response.get("analysis", ""),
         questions=ai_response.get("questions", ""),
@@ -155,21 +201,25 @@ async def create_review(
 
 
 @router.get("/{review_id}", response_model=ReviewNoteResponse)
-def get_review(
+async def get_review(
     review_id: int,
-    db: Annotated[Session, Depends(get_db)],
+    db: Annotated[AsyncSession, Depends(get_db)],
     current_user: Annotated[User, Depends(get_current_user)]
 ):
     """
     특정 복기 노트 조회
     본인의 복기 노트만 조회 가능합니다.
     """
-    review = db.query(ReviewNote).filter(
-        ReviewNote.id == review_id,
-        ReviewNote.user_id == current_user.id
-    ).first()
+    result = await db.execute(
+        select(ReviewNote).where(
+            ReviewNote.id == review_id,
+            ReviewNote.user_id == current_user.id
+        )
+    )
+    review = result.scalar_one_or_none()
     
     if not review:
+        logger.warning("복기 노트 조회 실패", review_id=review_id, user_id=current_user.id)
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="복기 노트를 찾을 수 없습니다."
@@ -179,17 +229,22 @@ def get_review(
 
 
 @router.get("", response_model=list[ReviewNoteResponse])
-def list_reviews(
+async def list_reviews(
     skip: int = 0,
     limit: int = 20,
-    db: Annotated[Session, Depends(get_db)],
+    db: Annotated[AsyncSession, Depends(get_db)],
     current_user: Annotated[User, Depends(get_current_user)]
 ):
     """
     현재 사용자의 복기 노트 목록 조회
     """
-    reviews = db.query(ReviewNote).filter(
-        ReviewNote.user_id == current_user.id
-    ).offset(skip).limit(limit).all()
+    result = await db.execute(
+        select(ReviewNote)
+        .where(ReviewNote.user_id == current_user.id)
+        .offset(skip)
+        .limit(limit)
+        .order_by(ReviewNote.created_at.desc())
+    )
+    reviews = result.scalars().all()
     
-    return reviews
+    return list(reviews)

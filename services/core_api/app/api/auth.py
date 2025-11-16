@@ -8,12 +8,14 @@ from datetime import datetime, timedelta
 from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session  # 하위 호환성을 위해 유지
 from passlib.context import CryptContext
 from jose import JWTError, jwt
 
 from ..db.session import get_db
 from ..db.models import User
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 from ..models.schemas import UserCreate, Token, UserResponse
 from ..core.config import get_settings
 
@@ -61,16 +63,17 @@ def create_access_token(data: dict, expires_delta: timedelta | None = None) -> s
 # ==================== 엔드포인트 구현 ====================
 
 @router.post("/register", response_model=Token, status_code=status.HTTP_201_CREATED)
-def register_user(
+async def register_user(
     user_data: UserCreate,
-    db: Annotated[Session, Depends(get_db)]
+    db: Annotated[AsyncSession, Depends(get_db)]
 ):
     """
     사용자 등록 엔드포인트
     새로운 사용자를 생성하고 JWT 토큰을 반환합니다.
     """
     # 1. 사용자 존재 여부 확인
-    db_user = db.query(User).filter(User.username == user_data.username).first()
+    result = await db.execute(select(User).where(User.username == user_data.username))
+    db_user = result.scalar_one_or_none()
     if db_user:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -86,8 +89,8 @@ def register_user(
     )
     
     db.add(new_user)
-    db.commit()
-    db.refresh(new_user)
+    await db.commit()
+    await db.refresh(new_user)
     
     # 3. JWT 토큰 생성 및 반환
     access_token = create_access_token(data={"sub": new_user.username})
@@ -95,16 +98,17 @@ def register_user(
 
 
 @router.post("/login", response_model=Token)
-def login_for_access_token(
+async def login_for_access_token(
     form_data: Annotated[OAuth2PasswordRequestForm, Depends()],
-    db: Annotated[Session, Depends(get_db)]
+    db: Annotated[AsyncSession, Depends(get_db)]
 ):
     """
     로그인 엔드포인트
     사용자 인증 후 JWT 토큰을 반환합니다.
     """
     # 1. 사용자 존재 여부 확인
-    user = db.query(User).filter(User.username == form_data.username).first()
+    result = await db.execute(select(User).where(User.username == form_data.username))
+    user = result.scalar_one_or_none()
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -133,7 +137,7 @@ def login_for_access_token(
 
 
 @router.get("/me", response_model=UserResponse)
-def get_current_user_info(
+async def get_current_user_info(
     current_user: Annotated[User, Depends(get_current_user)]
 ):
     """
@@ -144,17 +148,17 @@ def get_current_user_info(
 
 # ==================== 의존성 함수 (다른 API에서 사용) ====================
 
-def get_current_user(
+async def get_current_user(
     token: Annotated[str, Depends(oauth2_scheme)],
-    db: Annotated[Session, Depends(get_db)]
+    db: Annotated[AsyncSession, Depends(get_db)]
 ) -> User:
     """
-    JWT 토큰에서 현재 사용자 정보를 추출하는 의존성 함수
+    JWT 토큰에서 현재 사용자 정보를 추출하는 비동기 의존성 함수
     다른 API 엔드포인트에서 인증이 필요한 경우 사용합니다.
     
     Usage:
         @router.get("/protected")
-        def protected_route(user: User = Depends(get_current_user)):
+        async def protected_route(user: User = Depends(get_current_user)):
             return {"user_id": user.id}
     """
     credentials_exception = HTTPException(
@@ -171,7 +175,8 @@ def get_current_user(
     except JWTError:
         raise credentials_exception
     
-    user = db.query(User).filter(User.username == username).first()
+    result = await db.execute(select(User).where(User.username == username))
+    user = result.scalar_one_or_none()
     if user is None:
         raise credentials_exception
     

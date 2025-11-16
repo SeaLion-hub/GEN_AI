@@ -1,8 +1,19 @@
 # 파일 경로: services/core_api/app/services/gpt_service.py
 
 import openai
+from openai import AsyncOpenAI
 import os
 import json
+import asyncio
+from typing import Dict, Optional
+from ..core.config import get_settings
+from ..core.logging_config import get_logger
+
+# 로거 설정
+logger = get_logger(__name__)
+
+# 설정 가져오기
+settings = get_settings()
 
 # --- 1. AI의 역할 및 응답 형식 정의 (System) ---
 
@@ -46,26 +57,34 @@ AI는 아래의 우선순위와 기준을 '반드시' 따라서 9개 키워드 �
     * 명확한 보조 원인이 없다면, `null`을 반환합니다.
 """
 
-# --- 3. OpenAI API 호출 함수 (B님의 핵심 기능) ---
+# --- 3. OpenAI API 호출 함수 (비동기 버전) ---
 
-def get_ai_feedback(input_data: dict) -> dict:
+async def get_ai_feedback(input_data: dict) -> dict:
     """
-    입력 데이터를 받아 OpenAI API를 호출하고,
+    입력 데이터를 받아 OpenAI API를 비동기로 호출하고,
     분석, 질문, 분류가 포함된 JSON 응답을 반환합니다.
+    
+    재시도 로직 및 타임아웃 포함.
+    
+    Args:
+        input_data: AI 분석에 필요한 입력 데이터 딕셔너리
+    
+    Returns:
+        dict: AI 분석 결과 또는 에러 메시지가 포함된 딕셔너리
     """
     
-    # B님의 API 키 (환경 변수에서 불러오는 것을 권장)
-    # (A님과 공유할 때 이 부분은 .env 파일로 관리하세요)
-    try:
-        client = openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-    except Exception as e:
-        print("Error: OPENAI_API_KEY 환경 변수가 설정되지 않았습니다.")
+    # OpenAI 클라이언트 초기화
+    if not settings.OPENAI_API_KEY:
+        logger.error("OPENAI_API_KEY가 설정되지 않았습니다")
         return {"error": "API 키가 설정되지 않았습니다."}
-
+    
+    client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+    
     # 1. 입력 데이터를 JSON 문자열로 변환
     try:
         input_data_json = json.dumps(input_data, ensure_ascii=False, indent=2)
     except Exception as e:
+        logger.error("입력 데이터 JSON 변환 실패", error=str(e))
         return {"error": f"입력 데이터 JSON 변환 실패: {e}"}
 
     # 2. AI에게 전달할 최종 User 프롬프트 구성
@@ -89,29 +108,80 @@ def get_ai_feedback(input_data: dict) -> dict:
 {CLASSIFICATION_GUIDE}
 """
 
-    # 3. OpenAI API 호출
-    try:
-        completion = client.chat.completions.create(
-            model="gpt-4o",  # 또는 "gpt-4-turbo"
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": USER_PROMPT}
-            ],
-            response_format={"type": "json_object"}, # JSON 출력 모드 강제
-            temperature=0.2 # 일관성 있는 분석을 위해 온도를 낮게 설정
-        )
-        
-        response_content = completion.choices[0].message.content
-        
-        # 4. AI의 JSON 응답을 파싱하여 딕셔너리로 반환
-        return json.loads(response_content)
+    # 3. 재시도 로직을 포함한 OpenAI API 호출
+    max_retries = settings.MAX_RETRIES
+    retry_delay = settings.RETRY_DELAY
+    timeout = 30  # 30초 타임아웃
+    
+    for attempt in range(max_retries):
+        try:
+            logger.info(
+                "OpenAI API 호출 시도",
+                attempt=attempt + 1,
+                max_retries=max_retries
+            )
+            
+            completion = await asyncio.wait_for(
+                client.chat.completions.create(
+                    model=settings.OPENAI_MODEL,
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": USER_PROMPT}
+                    ],
+                    response_format={"type": "json_object"},
+                    temperature=0.2
+                ),
+                timeout=timeout
+            )
+            
+            response_content = completion.choices[0].message.content
+            
+            # 4. AI의 JSON 응답을 파싱하여 딕셔너리로 반환
+            result = json.loads(response_content)
+            logger.info("OpenAI API 호출 성공", attempt=attempt + 1)
+            return result
 
-    except openai.BadRequestError as e:
-        print(f"OpenAI API 요청 오류 (BadRequest): {e}")
-        return {"error": f"API 요청 오류: {e.message}"}
-    except Exception as e:
-        print(f"API 호출 중 예외 발생: {e}")
-        return {"error": "AI 응답 처리 중 오류가 발생했습니다."}
+        except asyncio.TimeoutError:
+            logger.warning(
+                "OpenAI API 호출 타임아웃",
+                attempt=attempt + 1,
+                timeout=timeout
+            )
+            if attempt == max_retries - 1:
+                return {"error": f"AI 응답 시간이 {timeout}초를 초과했습니다."}
+            await asyncio.sleep(retry_delay * (attempt + 1))  # 지수 백오프
+            
+        except openai.BadRequestError as e:
+            error_msg = str(e) if hasattr(e, '__str__') else "API 요청 오류"
+            logger.error(
+                "OpenAI API BadRequest 오류",
+                error=error_msg,
+                attempt=attempt + 1
+            )
+            return {"error": f"API 요청 오류: {error_msg}"}
+            
+        except openai.RateLimitError as e:
+            logger.warning(
+                "OpenAI API RateLimit 오류",
+                attempt=attempt + 1,
+                retry_after=retry_delay * (attempt + 1)
+            )
+            if attempt == max_retries - 1:
+                return {"error": "API 요청 한도 초과. 잠시 후 다시 시도해주세요."}
+            await asyncio.sleep(retry_delay * (attempt + 1))
+            
+        except Exception as e:
+            logger.error(
+                "OpenAI API 호출 중 예외 발생",
+                error=str(e),
+                error_type=type(e).__name__,
+                attempt=attempt + 1
+            )
+            if attempt == max_retries - 1:
+                return {"error": f"AI 응답 처리 중 오류가 발생했습니다: {str(e)}"}
+            await asyncio.sleep(retry_delay * (attempt + 1))
+    
+    return {"error": "AI 분석을 완료할 수 없습니다. 재시도 횟수를 초과했습니다."}
 
 
 # --- 4. B님을 위한 로컬 테스트 구문 ---

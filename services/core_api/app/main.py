@@ -6,9 +6,14 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import get_settings
+from app.core.logging_config import setup_logging, get_logger
 from app.db.models import Base
 from app.db.session import engine
 from app.api import auth, review
+
+# 로깅 초기화
+setup_logging()
+logger = get_logger(__name__)
 
 # 설정 가져오기
 settings = get_settings()
@@ -37,9 +42,12 @@ app.include_router(review.router, prefix=settings.API_V1_PREFIX)
 @app.on_event("startup")
 async def startup_event():
     """애플리케이션 시작 시 실행"""
+    logger.info("애플리케이션 시작", app_name=settings.APP_NAME, version="1.0.0")
     # 데이터베이스 테이블 생성 (개발 환경용)
     # 프로덕션에서는 Alembic 마이그레이션 사용 권장
-    Base.metadata.create_all(bind=engine)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    logger.info("데이터베이스 테이블 생성 완료")
 
 
 @app.get("/")
