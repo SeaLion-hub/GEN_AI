@@ -1,8 +1,7 @@
 """
 API 라우터 모듈
 """
+# (report 추가)
+from . import auth, review, report 
 
-from . import auth, review
-
-__all__ = ["auth", "review"]
-
+__all__ = ["auth", "review", "report"]

@@ -9,7 +9,7 @@ from app.core.config import get_settings
 from app.core.logging_config import setup_logging, get_logger
 from app.db.models import Base
 from app.db.session import engine
-from app.api import auth, review
+from app.api import auth, review, report
 
 # 로깅 초기화
 setup_logging()
@@ -37,7 +37,7 @@ app.add_middleware(
 # 라우터 등록
 app.include_router(auth.router, prefix=settings.API_V1_PREFIX)
 app.include_router(review.router, prefix=settings.API_V1_PREFIX)
-
+app.include_router(report.router, prefix=settings.API_V1_PREFIX)
 
 @app.on_event("startup")
 async def startup_event():
